@@ -386,7 +386,7 @@ The key to this name is "position-wise." It means this feed-forward network acts
 
 $$\mathrm{FFN}(x)=\max\left(0, xW_{1}+b_{1}\right) W_{2}+b_{2}$$
 
-Where $x$ is the output of the attention sublayer. $W_1,b_1,W_2,b_2$ are learnable parameters. Typically, the output dimension `d_ff` of the first linear layer is much larger than the input dimension `d_model` (for example, `d_ff = 4 * d_model`), then after ReLU activation, it is mapped back to `d_model` dimension through the second linear layer. This "expand then shrink" pattern, also called a bottleneck structure, is believed to help the model learn richer feature representations.
+Where $x$ is the output of the attention sublayer. $W_1,b_1,W_2,b_2$ are learnable parameters. Typically, the output dimension `d_ff` of the first linear layer is much larger than the input dimension `d_model` (for example, `d_ff = 4 * d_model`), then after ReLU activation, it is mapped back to `d_model` dimension through the second linear layer. This "expand then shrink" design is believed to help the model learn richer feature representations.
 
 In our PyTorch skeleton, we can implement this module with the following code:
 
@@ -553,8 +553,6 @@ Sentiment: Positive
 
 **One-shot Prompting** We provide the model with one complete example, showing it the task format and expected output style.
 
-We provide the model with one complete example, showing it the task format and expected output style.
-
 Case: We first give the model a complete "question-answer" pair as a demonstration, then pose our new question.
 
 ```Python
@@ -665,10 +663,13 @@ We know that computers essentially can only understand numbers. Therefore, befor
 
 Early natural language processing tasks might adopt simple tokenization strategies:
 
-- **Word-based**: Directly split sentences into words using spaces or punctuation. This method is intuitive but faces the problem of "vocabulary explosion." A language's vocabulary is huge; if each word is treated as an independent token, the vocabulary becomes difficult to manage. Worse, the model will be unable to handle any words not appearing in the vocabulary, such as "DatawhaleAgent."
-- **Character-based**: Split text into individual characters. This method has a very small vocabulary (e.g., English letters, numbers, and punctuation) and no OOV (Out-Of-Vocabulary) problem. But its disadvantage is that most individual characters don't have independent semantics, and the model needs to spend more effort learning how to combine characters into meaningful words, leading to low learning efficiency.
+-   **Word-based**: Directly splits sentences into words using spaces or punctuation. This method is intuitive but faces significant challenges:
+    -   **Vocabulary Explosion and OOV**: A language's vocabulary is vast. If each word is treated as an independent token, the vocabulary becomes difficult to manage. Worse, the model cannot handle any word that does not appear in its vocabulary (e.g., "DatawhaleAgent"). This phenomenon is known as the "Out-Of-Vocabulary" (OOV) problem.
+    -   **Lack of Semantic Association**: The model struggles to capture the semantic relationships between morphologically similar words. For instance, "look," "looks," and "looking" are treated as three completely different tokens, despite sharing a common core meaning. Similarly, the semantics of low-frequency words in the training data cannot be fully learned due to their rare occurrences.
 
-To balance vocabulary size and semantic expression, modern large language models generally adopt **Subword Tokenization** algorithms. The core idea is: keep common words (such as "agent") as complete tokens while splitting uncommon words (such as "Tokenization") into multiple meaningful subword fragments (such as "Token" and "ization"). This both controls vocabulary size and allows the model to understand and generate new words by combining subwords.
+-   **Character-based**: Splits text into individual characters. This method has a very small vocabulary (e.g., English letters, numbers, and punctuation) and thus avoids the OOV problem. However, its disadvantage is that individual characters mostly lack independent semantic meaning. The model must expend more effort learning to combine characters into meaningful words, leading to inefficient learning.
+
+To balance vocabulary size and semantic expression, modern large language models widely adopt **Subword Tokenization** algorithms. The core idea is to keep common words (like "agent") as single, complete tokens while breaking down uncommon words (like "Tokenization") into meaningful subword pieces (such as "Token" and "ization"). This approach not only controls the size of the vocabulary but also enables the model to understand and generate new words by combining subwords.
 
 **3.2.2.2 Byte-Pair Encoding Algorithm Analysis**
 
