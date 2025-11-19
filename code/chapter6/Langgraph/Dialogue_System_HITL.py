@@ -1,34 +1,34 @@
 """
-智能搜索助手 - 基于 LangGraph + Tavily API 的真实搜索系统
-1. 理解用户需求
-2. 使用Tavily API真实搜索信息  
-3. 生成基于搜索结果的回答
+智能搜索助手 - LangGraph + Tavily + Human-in-the-Loop（新版 API）
 """
 
 import asyncio
 from typing import TypedDict, Annotated
+
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_openai import ChatOpenAI
+
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.checkpoint.memory import InMemorySaver
-# from langgraph.checkpoint.redis import RedisSaver
+
+from langgraph.types import interrupt, Command  # ✅ 新 HITL API
+
 import os
 from dotenv import load_dotenv
 from tavily import TavilyClient
-from langgraph.types import interrupt, Command  # ✅ 新 HITL API
 
 # 加载环境变量
 load_dotenv()
 
 # 定义状态结构
 class SearchState(TypedDict):
-    messages: Annotated[list, add_messages]  # 包含所有消息的列表，包括用户查询和每个node的输出。
-    user_query: str        # 用户查询
-    search_query: str      # 优化后的搜索查询
+    messages: Annotated[list, add_messages]  # 包含所有消息的列表
+    user_query: str        # 用户查询（真实用户输入）
+    search_query: str      # 优化后的搜索查询（可被人修改确认）
     search_results: str    # Tavily搜索结果
     final_answer: str      # 最终答案
-    step: str             # 当前步骤
+    step: str              # 当前步骤
 
 # 初始化模型和Tavily客户端
 llm = ChatOpenAI(
@@ -37,20 +37,18 @@ llm = ChatOpenAI(
     base_url=os.getenv("LLM_BASE_URL", "https://api.openai.com/v1"),
     temperature=0.7
 )
-
-# 初始化Tavily客户端
 tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
 
 def understand_query_node(state: SearchState) -> SearchState:
-    """步骤1：理解用户查询并生成搜索关键词"""
-    
-    # 获取最新的用户消息
+    """步骤1：理解用户查询并生成搜索关键词（内置 HITL 确认）"""
+
+    # 获取最新用户消息
     user_message = ""
     for msg in reversed(state["messages"]):
         if isinstance(msg, HumanMessage):
             user_message = msg.content
             break
-    
+
     understand_prompt = f"""分析用户的查询："{user_message}"
 
 请完成两个任务：
@@ -61,49 +59,52 @@ def understand_query_node(state: SearchState) -> SearchState:
 理解：[用户需求总结]
 搜索词：[最佳搜索关键词]"""
 
-    response = llm.invoke([SystemMessage(content=understand_prompt)])
-    
-    # 提取搜索关键词
-    response_text = response.content
-    search_query = user_message  # 默认使用原始查询
-    
-    if "搜索词：" in response_text:
-        search_query = response_text.split("搜索词：")[1].strip()
-    elif "搜索关键词：" in response_text:
-        search_query = response_text.split("搜索关键词：")[1].strip()
-    
+    resp = llm.invoke([SystemMessage(content=understand_prompt)])
+    resp_text = resp.content
+
+    # 默认使用原始查询作为搜索词
+    search_query = user_message
+    if "搜索词：" in resp_text:
+        search_query = resp_text.split("搜索词：")[1].strip()
+    elif "搜索关键词：" in resp_text:
+        search_query = resp_text.split("搜索关键词：")[1].strip()
+
+    # ✅ Human-in-the-Loop：暂停等待人工确认/修改
+    human_feedback = interrupt({
+        "model_understanding": resp_text,
+        "suggested_search_query": search_query,
+        "prompt": "输入 yes 继续；或直接输入新的搜索关键词："
+    })
+
+    # 恢复后：如果人类输入不是 yes/空，则覆盖搜索词
+    if isinstance(human_feedback, str) and human_feedback.strip() and human_feedback.lower() != "yes":
+        search_query = human_feedback.strip()
+
     return {
-        "user_query": response.content,
+        "user_query": user_message,  # ✅ 修正：存真实用户问题
         "search_query": search_query,
         "step": "understood",
-        "messages": [AIMessage(content=f"我理解您的需求：{response.content}")]
+        "messages": [AIMessage(content=f"我理解您的需求：{resp_text}\n将使用搜索词：{search_query}")]
     }
 
 def tavily_search_node(state: SearchState) -> SearchState:
     """步骤2：使用Tavily API进行真实搜索"""
-    
-    search_query = state["search_query"]
-    
+    query = state["search_query"]
     try:
-        print(f"🔍 正在搜索: {search_query}")
-        
-        # 调用Tavily搜索API
+        print(f"🔍 正在搜索: {query}")
         response = tavily_client.search(
-            query=search_query,
+            query=query,
             search_depth="basic",
             include_answer=True,
             include_raw_content=False,
             max_results=5
         )
-        
+
         # 处理搜索结果
         search_results = ""
-        
-        # 优先使用Tavily的综合答案
         if response.get("answer"):
             search_results = f"综合答案：\n{response['answer']}\n\n"
-        
-        # 添加具体的搜索结果
+
         if response.get("results"):
             search_results += "相关信息：\n"
             for i, result in enumerate(response["results"][:3], 1):
@@ -111,20 +112,19 @@ def tavily_search_node(state: SearchState) -> SearchState:
                 content = result.get("content", "")
                 url = result.get("url", "")
                 search_results += f"{i}. {title}\n{content}\n来源：{url}\n\n"
-        
+
         if not search_results:
             search_results = "抱歉，没有找到相关信息。"
-        
+
         return {
             "search_results": search_results,
             "step": "searched",
-            "messages": [AIMessage(content=f"✅ 搜索完成！找到了相关信息，正在为您整理答案...")]
+            "messages": [AIMessage(content="✅ 搜索完成！找到了相关信息，正在为您整理答案...")]
         }
-        
+
     except Exception as e:
         error_msg = f"搜索时发生错误: {str(e)}"
         print(f"❌ {error_msg}")
-        
         return {
             "search_results": f"搜索失败：{error_msg}",
             "step": "search_failed",
@@ -133,25 +133,19 @@ def tavily_search_node(state: SearchState) -> SearchState:
 
 def generate_answer_node(state: SearchState) -> SearchState:
     """步骤3：基于搜索结果生成最终答案"""
-    
-    # 检查是否有搜索结果
     if state["step"] == "search_failed":
-        # 如果搜索失败，基于LLM知识回答
         fallback_prompt = f"""搜索API暂时不可用，请基于您的知识回答用户的问题：
 
 用户问题：{state['user_query']}
 
 请提供一个有用的回答，并说明这是基于已有知识的回答。"""
-        
         response = llm.invoke([SystemMessage(content=fallback_prompt)])
-        
         return {
             "final_answer": response.content,
             "step": "completed",
             "messages": [AIMessage(content=response.content)]
         }
-    
-    # 基于搜索结果生成答案
+
     answer_prompt = f"""基于以下搜索结果为用户提供完整、准确的答案：
 
 用户问题：{state['user_query']}
@@ -165,9 +159,7 @@ def generate_answer_node(state: SearchState) -> SearchState:
 3. 引用重要信息的来源
 4. 回答要结构清晰、易于理解
 5. 如果搜索结果不够完整，请说明并提供补充建议"""
-
     response = llm.invoke([SystemMessage(content=answer_prompt)])
-    
     return {
         "final_answer": response.content,
         "step": "completed",
@@ -177,87 +169,94 @@ def generate_answer_node(state: SearchState) -> SearchState:
 # 构建搜索工作流
 def create_search_assistant():
     workflow = StateGraph(SearchState)
-    
-    # 添加三个节点
     workflow.add_node("understand", understand_query_node)
     workflow.add_node("search", tavily_search_node)
     workflow.add_node("answer", generate_answer_node)
-    
-    # 设置线性流程
+
     workflow.add_edge(START, "understand")
     workflow.add_edge("understand", "search")
     workflow.add_edge("search", "answer")
     workflow.add_edge("answer", END)
-    
-    # 编译图
-    memory = InMemorySaver()
-    # memory = RedisSaver.from_url("redis://localhost:6379/0")
 
+    memory = InMemorySaver()
     app = workflow.compile(checkpointer=memory)
-    
     return app
 
 async def main():
-    """主函数：运行智能搜索助手"""
-    
-    # 检查API密钥
+    """主函数：运行智能搜索助手（支持 HITL 恢复）"""
+
     if not os.getenv("TAVILY_API_KEY"):
         print("❌ 错误：请在.env文件中配置TAVILY_API_KEY")
         return
-    
+
     app = create_search_assistant()
-    
-    print("🔍 智能搜索助手启动！")
-    print("我会使用Tavily API为您搜索最新、最准确的信息")
-    print("支持各种问题：新闻、技术、知识问答等")
+    print("🔍 智能搜索助手启动！（已启用 Human-in-the-Loop）")
     print("(输入 'quit' 退出)\n")
-    
-    session_count = 0
-    
+
+    # 固定 thread_id，保证多轮/中断可恢复
+    config = {"configurable": {"thread_id": "search-session-1"}}
+
     while True:
         user_input = input("🤔 您想了解什么: ").strip()
-        
         if user_input.lower() in ['quit', 'q', '退出', 'exit']:
             print("感谢使用！再见！👋")
             break
-        
         if not user_input:
             continue
-        
-        # 每个会话使用不同的 thread_id, 避免不同会话之间的状态混淆
-        # 每个会话的 thread_id 不同，LangGraph 会根据 thread_id 从 memory 中恢复状态
-        # 使用固定 thread_id，确保 InMemorySaver 可以恢复状态
-        # session_count += 1
-        config = {"configurable": {"thread_id": f"search-session-{session_count}"}}
-        
-        # 初始状态
-        # initial_state = {
-        #     "messages": [HumanMessage(content=user_input)],
-        #     "user_query": "",
-        #     "search_query": "",
-        #     "search_results": "",
-        #     "final_answer": "",
-        #     "step": "start"
-        # }
 
-        # 不再手动设置 initial_state，交给 LangGraph 从 memory 恢复
-        # 也就是说，新的message会自动添加到memory中，LangGraph会根据thread_id从memory中恢复状态
+        print("\n" + "="*60)
+
+        # 初始状态
         initial_state = {
             "messages": [HumanMessage(content=user_input)],
+            "user_query": user_input,
+            "search_query": "",
+            "search_results": "",
+            "final_answer": "",
+            "step": "start"
         }
-        
-        try:
-            print("\n" + "="*60)
 
-            
-            # 执行工作流
-            # 这里使用异步流处理，实时显示每个node的输出,注意output是一个字典,key是node_name,value是node_output,只包含当前node的输出,不包含其他node的输出。
-            # 它会按节点顺序异步产出中间结果（例如先产出 understand 的结果，然后是 search，再是 answer），这里用 async for 可以在每个节点完成时就处理/展示输出（实现“边处理边显示”）。
-            async for output in app.astream(initial_state, config=config):
+        # 可能会多次“中断→恢复”，直到到达 END
+        pending_resume = None
+        finished = False
 
-                for node_name, node_output in output.items():
-                    if "messages" in node_output and node_output["messages"]:
-                        latest_message = node_output["messages"][-1]
+        while not finished:
+            # 首次正常跑；中断后用 Command(resume=...)
+            if pending_resume is None:
+                stream_iter = app.stream(initial_state, config=config, stream_mode="updates")
+            else:
+                stream_iter = app.stream(Command(resume=pending_resume), config=config, stream_mode="updates")
+                pending_resume = None
+
+            interrupted = False
+
+            for event in stream_iter:
+                # 1) 处理中断事件（payload 在 __interrupt__ 中）
+                intr = event.get("__interrupt__")
+                if intr:
+                    # __interrupt__ 通常是一个包含 Interrupt 的序列；取出其 value
+                    interrupt_obj = intr[0] if isinstance(intr, (list, tuple)) else intr
+                    ivalue = getattr(interrupt_obj, "value", interrupt_obj)
+
+                    print("\n🛑 Human-in-the-Loop：")
+                    if isinstance(ivalue, dict):
+                        print(f"🧠 模型理解为：{ivalue.get('model_understanding')}")
+                        print(f"🔍 建议搜索关键词：{ivalue.get('suggested_search_query')}")
+                        print(ivalue.get("prompt", "👉 输入 yes 继续；或输入新的搜索关键词："))
+                    else:
+                        print(ivalue)
+
+                    pending_resume = input("> ").strip()
+                    interrupted = True
+                    break  # 跳出 for，下一轮用 Command(resume=...) 继续
+
+                # 2) 正常节点增量事件：打印 AI 消息
+                for node_name, node_output in event.items():
+                    if not isinstance(node_output, dict):
+                        continue
+                    msgs = node_output.get("messages") or []
+                    if msgs:
+                        latest_message = msgs[-1]
                         if isinstance(latest_message, AIMessage):
                             if node_name == "understand":
                                 print(f"🧠 理解阶段: {latest_message.content}")
@@ -265,14 +264,11 @@ async def main():
                                 print(f"🔍 搜索阶段: {latest_message.content}")
                             elif node_name == "answer":
                                 print(f"\n💡 最终回答:\n{latest_message.content}")
-            
-            print("\n" + "="*60 + "\n")
-        
-        except Exception as e:
-            print(f"❌ 发生错误: {e}")
-            print("请重新输入您的问题。\n")
 
+            if not interrupted:
+                finished = True  # 未被中断，说明到达 END
+
+        print("\n" + "="*60 + "\n")
 
 if __name__ == "__main__":
-    # 这个是支持多轮对话的
     asyncio.run(main())
